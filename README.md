@@ -294,8 +294,10 @@ trial, not inferred):
   the Poseidon value, not the vkHash.
 - **Line 75 / 78 — further params checks.** `strategyParams =
   [1,2,3,4,5,6,7,8]` fails at 75; `[0,0,0,0,0,0,0,1]` fails at 78.
-  The exact rules are NOT yet known — but all-zero `params[1..7]`
-  pass, so the proven configuration is safe. (See "Uncertainties".)
+  Rules now settled (comparison 2026-11-17, see "Uncertainties" §2):
+  p1 = FORTIFY when self < p1; p2 = HOLD when opp <= p2; p3 ∈ {0,1};
+  p4..7 = 0. All-zero `params[1..7]` pass, so the proven
+  configuration is safe.
 - **Line 90 — `params[0] > 0`.** All-zero params fail here for every
   action/amount tried; `params[0]=10` and `params[0]=1` pass. The
   extract amount must be positive.
@@ -364,11 +366,19 @@ above).
    used for verification". The Kurier integration is the best shot at
    the bonus, and it can only help (fail-soft); but the exact mapping
    is platform-side and unconfirmed until a live practice turn.
-2. **`strategyParams[1..7]` meanings and the line 75/78 rules.**
-   All zeros pass; nonzero values trip checks we have not fully
-   mapped. Irrelevant to this build (we use zeros), but a future
-   adaptive strategy (e.g. different amounts per state) would need
-   that mapping first — do not guess it.
+2. **`strategyParams[1..7]` meanings — SETTLED 2026-11-17
+   (comparison vs 20 public repos, `steal-comparison.md` §5 #6).**
+   Three independent repos agree exactly (JM-03
+   `src/strategyParams.ts`, Yetu89 README, nuraliana README):
+   p1 = FORTIFY when self < p1; p2 = HOLD when opp <= p2; p3 ∈ {0,1}
+   mode; p4..7 = 0; priority FORTIFY → HOLD → EXTRACT; amount == p0
+   exactly. Boundary corrections: `<=` not `<` (faaz12/DaddyUnikii
+   used `<` and would send an unprovable EXTRACT at exactly opp ==
+   p2), and NO amount capping (Camotir's clamp is proven wrong —
+   EXTRACT 3 at opp 3 FAILS line 149, EXTRACT 10 at opp 3 is VALID).
+   Irrelevant to this build (we use zeros), but a future adaptive
+   strategy no longer needs to re-derive the mapping — do not guess
+   beyond this.
 3. **`publicInputsHash` divergence check.** The field order is
    verbatim from the official TypeScript snippet and two independent
    computations agree, but the platform "independently computes this

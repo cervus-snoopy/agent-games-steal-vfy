@@ -125,7 +125,8 @@
  * 2026-11-16): proof + public_signals sit INSIDE policyProof;
  * action.amount is sent ONLY for EXTRACT and omitted entirely for
  * HOLD/FORTIFY (the schema rejects the field even when it is 0);
- * idempotencyKey is unique per (matchId, turn).
+ * idempotencyKey is a deterministic UUID derived from (matchId, turn)
+ * — unique per turn, identical on retry (comparison fix 2026-11-17).
  *
  * Usage:
  *   AGENT_GAMES_HMAC_SECRET=<from dashboard Rotate Secret> node server.js
@@ -321,6 +322,12 @@ function parseTurn(env) {
       /^0x[0-9a-fA-F]{64}$/.test(env.strategyCommitment.hash.trim())) {
     commitment = env.strategyCommitment.hash.trim().toLowerCase();
   }
+  // Loud warning on divergence (comparison #4): the envelope hash is
+  // authoritative, so keep using it — but a mismatch means the dashboard
+  // registration differs from our env, and every proof would be at risk.
+  if (commitment !== DEFAULT_COMMITMENT) {
+    console.warn(`[steal] WARNING: envelope commitment ${commitment.slice(0, 10)}... differs from local DEFAULT_COMMITMENT ${DEFAULT_COMMITMENT.slice(0, 10)}... — using the envelope value; check the dashboard registration if this repeats.`);
+  }
   const deadlineMs = env.deadlineAt ? Date.parse(env.deadlineAt) : NaN;
   if (env.deadlineAt && Number.isNaN(deadlineMs)) throw new Error('invalid deadlineAt');
   return {
@@ -443,12 +450,12 @@ function withTimeout(promise, ms, label) {
 // key, so a Kurier miss costs at most the +0..+2 verified-turn
 // reliability bonus — never the turn itself.
 
-// Full verification key, exported ONCE at startup (only when prove mode +
-// a Kurier key are set) and cached in memory — used for the
-// vkRegistered:false fallback. Never hardcoded.
+// Full verification key, exported ONCE at startup in prove mode and cached
+// in memory — used for the Kurier vkRegistered:false fallback AND for the
+// local proof verification in step 5 (comparison #2). Never hardcoded.
 let fullVkPromise = null;
 function initFullVk() {
-  if (PROOF_MODE !== 'prove' || !KURIER_API_KEY) return;
+  if (PROOF_MODE !== 'prove') return;
   if (fullVkPromise) return;
   fullVkPromise = (async () => {
     try {
@@ -579,6 +586,23 @@ async function kurierSubmitAndPoll(proof, publicSignals, registeredVkHex, budget
 const responseCache = new Map();
 function cacheKey(matchId, turn) { return `${matchId}:${turn}`; }
 
+// Deterministic UUIDv5-style idempotency key (comparison vs 20 public
+// repos, 2026-11-17): the /build response example shows a UUID-shaped
+// idempotencyKey ("a1b2c3d4-...") and the guide treats a missing or
+// mismatched required field as HOLD with no proof. A bare "matchId:turn"
+// string risks failing a format check, so derive a UUID from
+// sha256("steal:<matchId>:<turn>") with the version/variant bits set.
+// Deterministic -> a retried turn reuses the same key (idempotency
+// preserved); a new turn never does.
+function deterministicUuid(matchId, turn) {
+  const hash = crypto.createHash('sha256').update(`steal:${matchId}:${turn}`).digest();
+  const b = Buffer.from(hash.subarray(0, 16));
+  b[6] = (b[6] & 0x0f) | 0x50; // version 5
+  b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+  const hex = b.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 // ------------------------------------------------------------ HTTP layer --
 function sendJson(res, status, obj, sign = true) {
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -678,7 +702,7 @@ async function handleAgent(req, res, rawBody) {
       : { type: action.type },
     policyProof: { circuitVersion: 'v1' },
     agentTimestamp: new Date().toISOString(),
-    idempotencyKey: `${matchId}:${turn}`,
+    idempotencyKey: deterministicUuid(matchId, turn),
   };
 
   // 5. Proof (best effort, time-boxed inside the ~30 s push window).
@@ -692,6 +716,19 @@ async function handleAgent(req, res, rawBody) {
       const circuitInput = buildCircuitInput(parsed, action);
       const { proof, publicSignals } = await withTimeout(
         generateProof(circuitInput), budget, 'proof generation');
+      // Local verify (comparison #2, 2026-11-17): catch encoding,
+      // witness, or VK-mismatch bugs before the platform does — ~ms
+      // against a 0.5-0.8 s prove. On failure, answer WITHOUT the proof
+      // (same path as a prove failure: bounded -2, resolved as HOLD).
+      const vk = await getFullVk();
+      let verified = false;
+      try {
+        const snarkjs = await getSnarkjs();
+        verified = vk ? await snarkjs.groth16.verify(vk, publicSignals, proof) : false;
+      } catch (e) {
+        console.error(`[steal] match ${matchId} turn ${turn}: local proof verify error: ${e.message}`);
+      }
+      if (!verified) throw new Error('local proof verification failed');
       response.policyProof.proof = proof;
       response.policyProof.public_signals = publicSignals;
       response.policyProof.publicInputsHash = computePublicInputsHash(parsed, action);
@@ -757,8 +794,28 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[steal] listening on 0.0.0.0:${PORT} /agent (proof mode: ${PROOF_MODE}, ` +
-    `proof budget: ${PROOF_BUDGET_MS}ms, kurier: ${KURIER_API_KEY ? 'configured' : 'not configured'}, ` +
-    `commitment: ${DEFAULT_COMMITMENT.slice(0, 10)}..., params: [${STRATEGY_PARAMS.join(',')}])`);
-});
+// Startup commitment check (comparison #4, 2026-11-17): recompute
+// Poseidon(strategyParams ++ [salt]) and FATAL on mismatch with the
+// registered DEFAULT_COMMITMENT. A wrong value pasted into env would
+// otherwise fail every proof at template line 72 with no early warning.
+async function verifyCommitmentAtStartup() {
+  const { buildPoseidon } = require('circomlibjs');
+  const poseidon = await buildPoseidon();
+  const F = poseidon.F;
+  const inputs = [...STRATEGY_PARAMS.map((p) => F.e(p)), F.e(STEAL_SALT)];
+  const computed = '0x' + BigInt(F.toString(poseidon(inputs))).toString(16).padStart(64, '0');
+  if (computed !== DEFAULT_COMMITMENT) {
+    console.error(`[steal] FATAL: commitment mismatch — Poseidon(params, salt) = ${computed}, but STEAL_COMMITMENT = ${DEFAULT_COMMITMENT}. Fix the env; refusing to start.`);
+    process.exit(1);
+  }
+  console.log(`[steal] commitment verified at startup: ${computed.slice(0, 10)}...`);
+}
+
+(async () => {
+  await verifyCommitmentAtStartup();
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`[steal] listening on 0.0.0.0:${PORT} /agent (proof mode: ${PROOF_MODE}, ` +
+      `proof budget: ${PROOF_BUDGET_MS}ms, kurier: ${KURIER_API_KEY ? 'configured' : 'not configured'}, ` +
+      `commitment: ${DEFAULT_COMMITMENT.slice(0, 10)}..., params: [${STRATEGY_PARAMS.join(',')}])`);
+  });
+})();
