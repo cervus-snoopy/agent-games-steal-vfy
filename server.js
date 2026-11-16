@@ -160,7 +160,7 @@ const HMAC_SECRET = process.env.AGENT_GAMES_HMAC_SECRET || '';
 const PROOF_MODE = (process.env.PROOF_MODE || 'prove').toLowerCase();
 const PROOF_BUDGET_MS = parseInt(process.env.PROOF_BUDGET_MS || '20000', 10);
 // The platform waits ~30 s per push; answer well inside that.
-const ANSWER_BUDGET_MS = parseInt(process.env.ANSWER_BUDGET_MS || '25000', 10);
+const ANSWER_BUDGET_MS = parseInt(process.env.ANSWER_BUDGET_MS || '40000', 10);
 // Kurier on-chain submission (optional, env KURIER_API_KEY). Absent a key
 // the agent answers with the local proof only (same as before). When set,
 // the proof is submitted to Kurier after generation and, on Finalized,
@@ -169,7 +169,7 @@ const ANSWER_BUDGET_MS = parseInt(process.env.ANSWER_BUDGET_MS || '25000', 10);
 // Budget is capped so the answer still lands inside ANSWER_BUDGET_MS.
 const KURIER_API_KEY = (process.env.KURIER_API_KEY || '').trim();
 const KURIER_BASE = (process.env.KURIER_BASE || 'https://api.kurier.xyz/api/v1').replace(/\/+$/, '');
-const KURIER_POLL_BUDGET_MS = parseInt(process.env.KURIER_POLL_BUDGET_MS || '15000', 10);
+const KURIER_POLL_BUDGET_MS = parseInt(process.env.KURIER_POLL_BUDGET_MS || '30000', 10);
 
 const WASM_PATH = path.join(__dirname, 'circuits', 'vfy-policy.wasm');
 const ZKEY_PATH = path.join(__dirname, 'circuits', 'vfy-policy_final.zkey');
@@ -691,6 +691,19 @@ async function handleAgent(req, res, rawBody) {
     parseFailed = true;
   }
 
+  // 4c. Effective answer budget: never run past the envelope's own
+  // deadlineAt. Practice pushes carry a ~10 s deadline while
+  // competition turns carry 60 s; a fixed budget times out practice
+  // (2026-11-17: 16 s answer vs a <16 s practice window) and wastes
+  // the tight window. Cap at deadline - 3 s margin, floored at 5 s
+  // so a proof (~1 s) always fits. No deadlineAt -> fixed budget.
+  let effectiveAnswerBudgetMs = ANSWER_BUDGET_MS;
+  if (parsed && !Number.isNaN(parsed.deadlineMs)) {
+    const toDeadline = parsed.deadlineMs - startedAt - 3000;
+    if (toDeadline > 0) effectiveAnswerBudgetMs = Math.min(ANSWER_BUDGET_MS, toDeadline);
+  }
+  effectiveAnswerBudgetMs = Math.max(5000, effectiveAnswerBudgetMs);
+
   const response = {
     matchId,
     turn: Number.isNaN(Number(turn)) ? turn : Number(turn),
@@ -705,12 +718,13 @@ async function handleAgent(req, res, rawBody) {
     idempotencyKey: deterministicUuid(matchId, turn),
   };
 
-  // 5. Proof (best effort, time-boxed inside the ~30 s push window).
-  // A proof-less action response costs -2 and resolves as HOLD, so a
-  // proof is attempted for every decided action including HOLD — the
-  // circuit must allow the action under the committed strategy.
+  // 5. Proof (best effort, time-boxed inside the effective answer
+  // budget — see 4c. A proof-less action response costs -2 and
+  // resolves as HOLD, so a proof is attempted for every decided
+  // action including HOLD — the circuit must allow the action under
+  // the committed strategy.
   if (PROOF_MODE === 'prove' && parsed && !parseFailed) {
-    const remaining = ANSWER_BUDGET_MS - (Date.now() - startedAt) - 3000; // 3 s margin to answer
+    const remaining = effectiveAnswerBudgetMs - (Date.now() - startedAt) - 3000; // 3 s margin to answer
     const budget = Math.max(1000, Math.min(PROOF_BUDGET_MS, remaining));
     try {
       const circuitInput = buildCircuitInput(parsed, action);
@@ -746,8 +760,8 @@ async function handleAgent(req, res, rawBody) {
   }
 
   // 6. Kurier: submit the proof on-chain and wait for Finalized (best
-  // effort, strictly inside the ~30 s push window). On Finalized with a
-  // txHash, the on-chain tx hash is attached as
+  // effort, strictly inside the effective answer budget — see 4c).
+  // On Finalized with a txHash, the on-chain tx hash is attached as
   // policyProof.proofReference — the audit pointer the platform links
   // to the match replay and proof record, and the best shot at the
   // +0..+2 verified-turn reliability bonus. Any failure leaves the
@@ -756,7 +770,7 @@ async function handleAgent(req, res, rawBody) {
   if (KURIER_API_KEY && response.policyProof.proof) {
     const kurierBudget = Math.min(
       KURIER_POLL_BUDGET_MS,
-      ANSWER_BUDGET_MS - (Date.now() - startedAt) - 2000,
+      effectiveAnswerBudgetMs - (Date.now() - startedAt) - 2000,
     );
     if (kurierBudget > 5000) {
       const fullVk = await getFullVk();
